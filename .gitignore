@@ -1,0 +1,5 @@
+/codecarbon-master/
+/codecarbon_cleaned/
+.env
+.venv
+__pycache__/

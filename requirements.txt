@@ -1,0 +1,10 @@
+langchain
+langchain_openai
+langchain_community
+langchain_experimental
+langchain_neo4j
+neo4j
+transformers
+tree-sitter 
+pyyaml
+python-dotenv

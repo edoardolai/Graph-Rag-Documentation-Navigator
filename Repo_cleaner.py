@@ -1,6 +1,13 @@
 import os
 import shutil
+from dotenv import load_dotenv
 from collections import defaultdict
+
+load_dotenv()
+
+source_dir_path = os.getenv("RAW_REPO_DIRECTORY_PATH")
+destination_dir_path = os.getenv("CLEANED_REPO_DIRECTORY_PATH")
+
 
 def get_file_types(source_dir):
     """
@@ -15,24 +22,28 @@ def get_file_types(source_dir):
 
     return file_types
 
-def copy_excluding_files(file_types, excluded_extensions, destination_dir):
+
+def copy_excluding_files(file_types, included_extensions, destination_dir):
     """
-    Copy all files except those with specified extensions 
+    Copy all files except those with specified extensions
     """
     if not os.path.exists(destination_dir):
         os.makedirs(destination_dir)
 
     for ext, files in file_types.items():
-        if ext not in excluded_extensions:
+        if ext in included_extensions:
             for file in files:
                 dest_path = os.path.join(destination_dir, os.path.basename(file))
                 shutil.copy2(file, dest_path)
                 print(f"Copied: {file} -> {dest_path}")
 
+
 if __name__ == "__main__":
-    source_directory = r"C:\Users\hp\Imad\Orange\codecarbon"
-    destination_directory = r"C:\Users\hp\Imad\Orange\codecarbon_cleaned"
-    excluded_file_types = {".md", ".rst", ".drawio", ".svg", ".png", ".jpg", ".gif", ".ico", ".rst",".example" }
+    # update to macos path
+    source_directory = source_dir_path
+
+    destination_directory = destination_dir_path
+    included_file_types = {".py", ".js", ".html", ".css", ".ts", ".tsx"}
 
     # Get all file types in the repo
     file_types_dict = get_file_types(source_directory)
@@ -43,6 +54,6 @@ if __name__ == "__main__":
         print(f"{ext}: {len(files)} files")
 
     # Copy all except excluded files
-    copy_excluding_files(file_types_dict, excluded_file_types, destination_directory)
+    copy_excluding_files(file_types_dict, included_file_types, destination_directory)
 
     print("File cleaning completed.")
