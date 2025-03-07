@@ -91,7 +91,8 @@ def load_and_chunk_documents(repo_path, chunk_size=800, chunk_overlap=100):
                     )
                 else:  # fallback to generic splitter
                     splitter = RecursiveCharacterTextSplitter(
-                        chunk_size=chunk_size, chunk_overlap=chunk_overlap
+                        chunk_size=chunk_size,
+                        chunk_overlap=chunk_overlap,
                     )
 
                 chunks = splitter.split_documents(docs)
@@ -298,6 +299,37 @@ def process_chunk_with_llm(llm_transformer, chunk, retries=3, backoff_factor=2):
                 return []
 
 
+# Technical implementation note:
+#
+# Regarding the individual chunk processing approach:
+# Each chunk is processed individually (within a batch) with LLMGraphTransformer
+# rather than chunking all documents together and passing them at once to the transformer.
+# I avoided doing something like:
+#               docs = loader.load()
+#               chunks = splitter.split_documents(docs)
+#               graph_documents = llm_transformer.convert_to_graph_documents(chunks)
+
+# This has been done for some good reasons (after trial and error):
+#
+# 1. LLM Token Limits: The API call (OpenAI) would exceed token limits immediately. Each code chunk uses hundreds or thousands of tokens,
+#    and LLMs have fixed context windows.
+#
+# 2. Granular Error Handling: If processing fails for one chunk, we don't lose progress on all chunks.
+#    The try/except blocks (LengthFinishReasonError) show this design intent.
+#
+# 3. Retry Logic: The exponential backoff retry system (sleep_time = backoff_factor**attempt)
+#    works at the individual chunk level, allowing precise retries (initial back off and #retries can be customized).
+#
+# 4. Incremental database updates: Each successfully processed chunk immediately writes
+#    its entities to Neo4j, so we get partial results even if the process is interrupted (this was particularly useful in the development phase).
+#
+# 5. Progress tracking: Processing chunks individually allows us to show detailed progress
+#    with tqdm, which it turns out be useful given the enormous amount of time needed to chunk all documents and process all chunks.
+#
+# I'm still learning about LLMs, but after some different stagies tried this approach maximizes reliability at the
+# expense of some processing speed.
+
+
 def extract_entities_from_chunks(graph, chunks, batch_size=10):
     """Extract entities from chunks using LLMGraphTransformer"""
     print("Extracting entities from chunks...")
@@ -458,8 +490,157 @@ def extract_entities_from_chunks(graph, chunks, batch_size=10):
         print(f"  - {rel_type}: {count}")
 
 
+def create_semantic_relationships(graph):
+    """Create semantic relationships between entities based on text content and structure"""
+    print("\nCreating semantic relationships...")
+
+    # Track counts for monitoring
+    created_counts = {
+        "IMPLEMENTED_IN": 0,
+        "PROVIDES": 0,
+        "INTEGRATES_WITH": 0,
+        "CALLS": 0,
+        "BELONGS_TO": 0,
+    }
+
+    # 1. Create IMPLEMENTED_IN relationships: Feature -> Document
+    print("Creating Feature-IMPLEMENTED_IN->Document relationships...")
+    result = graph.query(
+        """
+    MATCH (f:Feature)-[:DEFINED_IN]->(tc:TextChunk)-[:PART_OF]->(d:Document)
+    WHERE NOT EXISTS((f)-[:IMPLEMENTED_IN]->(d))
+    MERGE (f)-[:IMPLEMENTED_IN]->(d)
+    RETURN count(*) as count
+    """
+    )
+    created_counts["IMPLEMENTED_IN"] = result[0]["count"]
+    print(f"  Created {created_counts['IMPLEMENTED_IN']} IMPLEMENTED_IN relationships")
+
+    # 2. Create PROVIDES relationships using text-based inference
+    # Look for Component and Feature nodes defined in the same or related TextChunks
+    print("Creating Component-PROVIDES->Feature relationships...")
+    result = graph.query(
+        """
+    MATCH (c:Component)-[:DEFINED_IN]->(tc1:TextChunk)
+    MATCH (f:Feature)-[:DEFINED_IN]->(tc2:TextChunk)
+    WHERE tc1.chunk_id = tc2.chunk_id OR 
+          tc1.text CONTAINS f.name OR 
+          tc2.text CONTAINS c.name
+    WITH c, f
+    WHERE NOT EXISTS((c)-[:PROVIDES]->(f))
+    MERGE (c)-[:PROVIDES]->(f)
+    RETURN count(*) as count
+    """
+    )
+    created_counts["PROVIDES"] = result[0]["count"]
+    print(f"  Created {created_counts['PROVIDES']} PROVIDES relationships")
+
+    # 3. Create INTEGRATES_WITH relationships for Integrations
+    print("Creating Integration-INTEGRATES_WITH->Document relationships...")
+    result = graph.query(
+        """
+    MATCH (i:Integration)-[:DEFINED_IN]->(tc:TextChunk)-[:PART_OF]->(d:Document)
+    WHERE NOT EXISTS((i)-[:INTEGRATES_WITH]->(d))
+    MERGE (i)-[:INTEGRATES_WITH]->(d)
+    RETURN count(*) as count
+    """
+    )
+    created_counts["INTEGRATES_WITH"] = result[0]["count"]
+    print(
+        f"  Created {created_counts['INTEGRATES_WITH']} INTEGRATES_WITH relationships"
+    )
+
+    # 4. Create CALLS relationships between Functions
+    # This is more complex - we'll use text analysis to infer function calls
+    print("Creating Function-CALLS->Function relationships...")
+    result = graph.query(
+        """
+    MATCH (fn1:Function)
+    MATCH (fn2:Function)
+    WHERE fn1 <> fn2
+    WITH fn1, fn2
+    MATCH (fn1)-[:DEFINED_IN]->(tc:TextChunk)
+    WHERE tc.text CONTAINS fn2.name
+    AND NOT EXISTS((fn1)-[:CALLS]->(fn2))
+    MERGE (fn1)-[:CALLS]->(fn2)
+    RETURN count(*) as count
+    """
+    )
+    created_counts["CALLS"] = result[0]["count"]
+    print(f"  Created {created_counts['CALLS']} CALLS relationships")
+
+    # 5. Create BELONGS_TO relationships between Functions and Classes
+    print("Creating Function-BELONGS_TO->Class relationships...")
+    result = graph.query(
+        """
+    MATCH (fn:Function)-[:DEFINED_IN]->(tc1:TextChunk)
+    MATCH (c:Class)-[:DEFINED_IN]->(tc2:TextChunk)
+    MATCH (tc1)-[:PART_OF]->(d:Document)<-[:PART_OF]-(tc2)
+    WHERE tc1.chunk_id = tc2.chunk_id OR d IS NOT NULL
+    WITH fn, c
+    WHERE NOT EXISTS((fn)-[:BELONGS_TO]->(c))
+    MERGE (fn)-[:BELONGS_TO]->(c)
+    RETURN count(*) as count
+    """
+    )
+    created_counts["BELONGS_TO"] = result[0]["count"]
+    print(f"  Created {created_counts['BELONGS_TO']} BELONGS_TO relationships")
+
+    return created_counts
+
+
+def validate_relationships(graph):
+    """Validate that the relationships needed for queries exist"""
+    print("\nValidating relationships...")
+
+    # Check counts of each relationship type
+    result = graph.query(
+        """
+    MATCH ()-[r]->()
+    RETURN type(r) as type, count(r) as count
+    ORDER BY count DESC
+    """
+    )
+
+    print("Relationship counts in database:")
+    for row in result:
+        print(f"  {row['type']}: {row['count']}")
+
+    # Verify specific relationships used in your queries
+    relationship_checks = [
+        "MATCH (f:Feature)-[:IMPLEMENTED_IN]->(d:Document) RETURN count(*) as count",
+        "MATCH (c:Component)-[:PROVIDES]->(f:Feature) RETURN count(*) as count",
+        "MATCH (i:Integration)-[:INTEGRATES_WITH]->() RETURN count(*) as count",
+        "MATCH (fn:Function)-[:CALLS]->() RETURN count(*) as count",
+        "MATCH (fn:Function)-[:BELONGS_TO]->() RETURN count(*) as count",
+    ]
+
+    for check in relationship_checks:
+        count = graph.query(check)[0]["count"]
+        print(f"  {check}: {count}")
+
+
+def test_query_engine(graph):
+    """Test the query engine with test queries"""
+    print("\nTesting query engine with sample queries...")
+
+    # Perform sample queries that would be used by query_engine.py
+    test_query = """
+    MATCH (f:Feature)-[:IMPLEMENTED_IN]->(d:Document)
+    WHERE f.name CONTAINS 'track' OR f.name CONTAINS 'monitor' 
+    RETURN f.name, d.file_path LIMIT 5
+    """
+
+    result = graph.query(test_query)
+    print(f"Found {len(result)} results for test query")
+    for row in result:
+        print(f"  Feature: {row.get('f.name')}, Document: {row.get('d.file_path')}")
+
+
 def main():
     """Main function to build the graph database"""
+    start_time = time.time()
+
     # Connect to Neo4j
     url = os.getenv("NEO4J_URL")
     username = os.getenv("NEO4J_USERNAME")
@@ -480,41 +661,29 @@ def main():
     # Extract entities from chunks
     extract_entities_from_chunks(graph, chunks)
 
+    # Create semantic relationships
+    created_counts = create_semantic_relationships(graph)
+
+    # Validate that relationships exist
+    validate_relationships(graph)
+
+    # Test the query engine
+    test_query_engine(graph)
+
+    end_time = time.time()
+    print(f"\nDatabase build completed in {end_time - start_time:.2f} seconds")
+
+    # Print summary of created relationships
+    print("\nSummary of created relationships:")
+    for rel_type, count in created_counts.items():
+        print(f"  {rel_type}: {count}")
+
     print("\nFinal Graph Schema:")
     print(graph.get_schema)
-    print("\nDatabase build complete!")
+    print(
+        "\nDatabase build complete! You can now use query_engine.py to query the codebase."
+    )
 
 
 if __name__ == "__main__":
     main()
-
-
-# Technical implementation note:
-#
-# Regarding the individual chunk processing approach:
-# Each chunk is processed individually with (within a batch) withLLMGraphTransformer
-# rather than chunking all documents together and passing them all at once to the transformer,
-# Something like:
-#               docs = loader.load()
-#               chunks = splitter.split_documents(docs)
-#               graph_documents = llm_transformer.convert_to_graph_documents(chunks)
-
-# This has been done for some good reasons (after trial and error):
-#
-# 1. LLM Token Limits: The API call (OpenAI) would exceed token limits immediately. Each code chunk uses hundreds or thousands of tokens,
-#    and LLMs have fixed context windows.
-#
-# 2. Granular Error Handling: If processing fails for one chunk, we don't lose progress on all chunks.
-#    The try/except blocks (LengthFinishReasonError) show this design intent.
-#
-# 3. Retry Logic: The exponential backoff retry system (sleep_time = backoff_factor**attempt)
-#    works at the individual chunk level, allowing precise retries (initial back off and #retries can be customized).
-#
-# 4. Incremental database updates: Each successfully processed chunk immediately writes
-#    its entities to Neo4j, so we get partial results even if the process is interrupted (this was particularly useful in the development phase).
-#
-# 5. Progress tracking: Processing chunks individually allows us to show detailed progress
-#    with tqdm, which it turns out be useful given the enormous amount of time needed to chunk all documents and process all chunks.
-#
-# I'm still learning about LLMs, but after some different stagies tried this approach maximizes reliability at the
-# expense of some processing speed.

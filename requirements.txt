@@ -8,3 +8,4 @@ transformers
 tree-sitter 
 pyyaml
 python-dotenv
+streamlit
