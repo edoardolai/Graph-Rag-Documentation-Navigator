@@ -55,7 +55,7 @@ The system consists of four main components:
 ### Step 1: Clone the repository
 
 ```bash
-git clone https://github.com/yourusername/graph-rag-documentation-navigator.git
+git clone https://github.com/edoardolai/graph-rag-documentation-navigator.git
 cd graph-rag-documentation-navigator
 ```
 
