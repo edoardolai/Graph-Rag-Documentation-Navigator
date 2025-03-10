@@ -3,4 +3,4 @@
 .env
 .venv
 __pycache__/
-templates_codecarbon.py
+# templates_codecarbon.py
